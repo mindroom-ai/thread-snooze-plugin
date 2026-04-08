@@ -1,28 +1,42 @@
-# Thread Snooze Plugin
+# Thread Snooze
 
-MindRoom plugin for snoozing threads — temporarily resolve a thread and automatically unresolve it at a specified time.
+[![License](https://img.shields.io/github/license/mindroom-ai/thread-snooze-plugin)](https://github.com/mindroom-ai/thread-snooze-plugin/blob/main/LICENSE)
+[![Docs](https://img.shields.io/badge/docs-plugins-blue)](https://docs.mindroom.chat/plugins/)
+[![Hooks](https://img.shields.io/badge/docs-hooks-blue)](https://docs.mindroom.chat/hooks/)
 
-## How It Works
+<img src="https://media.githubusercontent.com/media/mindroom-ai/mindroom/refs/heads/main/frontend/public/logo.png" alt="MindRoom Logo" align="right" width="120" />
 
-1. Tag a thread with `snoozed` (set `data.until` to an ISO-8601 datetime)
-2. The thread is resolved (hidden from active view)
-3. At the specified time, the thread auto-unresolves and a notification is posted
+Snooze threads for [MindRoom](https://github.com/mindroom-ai/mindroom) agents — temporarily resolve a thread and automatically unresolve it at a specified time.
 
-## Tools
+When a thread needs attention later but not now, snooze it. The thread gets resolved (hidden from active view), and at the specified time it unresolves and posts a notification so nothing falls through the cracks. Tags are the persistence layer — no database, no scheduler integration, just Matrix state events and `asyncio` tasks.
 
-- `snooze_thread(until, note=None)` — snooze the current thread until the given ISO-8601 datetime (UTC). Adds `snoozed` + `resolved` tags and schedules a wake task.
-- `unsnooze_thread()` — cancel an active snooze. Removes `snoozed` + `resolved` tags and cancels the wake task.
+## How it works
+
+1. Agent calls `snooze_thread(until="2026-04-10T09:00")` or user tags a thread with `snoozed` (with `data.until` set to an ISO-8601 datetime)
+2. Thread is resolved — disappears from active view
+3. Plugin spawns an `asyncio` task that sleeps until the target time
+4. When the snooze expires: `snoozed` and `resolved` tags are removed, a notification is posted, and the thread reappears
+5. On restart, `bot:ready` rescans all rooms and re-creates wake tasks for any still-snoozed threads. Expired snoozes fire immediately.
+
+## Agent tools
+
+| Tool | Purpose |
+|------|---------|
+| `snooze_thread(until, note=None)` | Snooze the current thread until an ISO-8601 datetime (UTC). Adds `snoozed` + `resolved` tags. |
+| `unsnooze_thread()` | Cancel an active snooze. Removes tags and cancels the wake task. |
 
 ## Hooks
 
-- `resume_snoozed_threads` on `bot:ready` (priority 90) — rescans all rooms on restart, re-creates wake tasks for any threads still tagged `snoozed`. Expired snoozes fire immediately.
-- `schedule_manual_snooze_tag` on `tool:after_call` (priority 100) — detects when someone uses the generic `tag_thread("snoozed")` or `untag_thread("snoozed")` tools and spawns/cancels wake tasks accordingly.
+| Hook | Event | Purpose |
+|------|-------|---------|
+| `resume_snoozed_threads` | `bot:ready` | Rescan all rooms on startup, re-create wake tasks (priority 90) |
+| `schedule_manual_snooze_tag` | `tool:after_call` | Detect manual `tag_thread("snoozed")` / `untag_thread("snoozed")` and spawn/cancel wake tasks (priority 100) |
 
-## Tag Format
+## Tag format
 
-- Tag name: `snoozed`
-- Tag data: `{"until": "2026-04-10T09:00:00+00:00", "note": "optional note"}`
-- All datetimes in UTC. Agent is responsible for timezone conversion.
+- **Tag name:** `snoozed`
+- **Tag data:** `{"until": "2026-04-10T09:00:00+00:00", "note": "optional"}`
+- All datetimes in UTC. The agent is responsible for timezone conversion.
 
 ## Setup
 
@@ -37,11 +51,8 @@ MindRoom plugin for snoozing threads — temporarily resolve a thread and automa
 
 ## Architecture
 
-- **Zero core changes** — pure plugin
-- **Tags are the persistence layer** — no separate state events or database
+- **Pure plugin** — no MindRoom core changes required
+- **Tags are the persistence layer** — the `snoozed` tag with `data.until` is the single source of truth
 - **`asyncio.create_task()`** for wake timing — tasks die on restart, `bot:ready` rescans and re-creates them
 - **Race-safe** — wake tasks verify tag state before clearing (prevents stale wake from erasing a newer snooze)
-
-## License
-
-MIT
+- **Interop** — works with both the dedicated tools and the generic `tag_thread` / `untag_thread` tools
