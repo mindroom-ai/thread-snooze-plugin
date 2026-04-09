@@ -146,7 +146,16 @@ class ThreadSnoozeTools(Toolkit):
         )
 
     async def snooze_thread(self, until: str, note: str | None = None) -> str:
-        """Snooze the current thread until an exact future datetime."""
+        """Snooze the current thread until an exact future ISO-8601 datetime.
+
+        Args:
+            until: ISO-8601 datetime string for when to wake the thread.
+                Must be in the future. Include timezone offset or use 'Z' for UTC.
+                Naive datetimes (no timezone) are treated as UTC.
+                Examples: '2026-04-10T14:00:00Z', '2026-04-10T09:00:00-07:00',
+                '2026-04-11T18:30:00+02:00'.
+            note: Optional note explaining why the thread was snoozed.
+        """
         context = get_tool_runtime_context()
         if context is None:
             return _context_error("snooze", message="Thread snooze tool context is unavailable in this runtime path.")
