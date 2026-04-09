@@ -6,12 +6,17 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.hooks import AgentLifecycleContext, ToolAfterCallContext, hook
-from mindroom.thread_tags import THREAD_TAGS_EVENT_TYPE
+from mindroom.thread_tags import (
+    THREAD_TAGS_EVENT_TYPE,
+    ThreadTagsError,
+    ThreadTagsState,
+    list_tagged_threads_from_state_map,
+    remove_thread_tag_via_room_state,
+)
 
 if TYPE_CHECKING:
     from structlog.stdlib import BoundLogger
@@ -19,6 +24,7 @@ if TYPE_CHECKING:
 SNOOZE_TAG = "snoozed"
 RESOLVED_TAG = "resolved"
 SNOOZE_EXPIRED_MESSAGE = "\u23f0 Snooze expired"
+SNOOZE_WAKE_RETRY_DELAY = timedelta(seconds=30)
 _snooze_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
 
 ThreadMessageSender = Callable[[str, str, str | None], Awaitable[str | None]]
@@ -48,32 +54,6 @@ def parse_snooze_until(value: object) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
-def _thread_tag_state_key(thread_root_id: str, tag: str) -> str:
-    """Build one per-tag Matrix room-state key."""
-    return json.dumps([thread_root_id, tag], separators=(",", ":"))
-
-
-def _parse_snoozed_thread_root(state_key: object) -> str | None:
-    """Return the thread root for one snoozed tag state key."""
-    if not isinstance(state_key, str):
-        return None
-
-    try:
-        parsed = json.loads(state_key)
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-    if not isinstance(parsed, list) or len(parsed) != 2:
-        return None
-
-    thread_root_id, tag = parsed
-    if not isinstance(thread_root_id, str) or not thread_root_id.strip():
-        return None
-    if tag != SNOOZE_TAG:
-        return None
-    return thread_root_id
-
-
 def _parse_until_from_tag_content(content: object) -> datetime | None:
     """Extract one snooze timestamp from a thread-tag payload."""
     if not isinstance(content, Mapping):
@@ -84,6 +64,16 @@ def _parse_until_from_tag_content(content: object) -> datetime | None:
         return None
 
     return parse_snooze_until(data.get("until"))
+
+
+def _snooze_until_from_state(state: ThreadTagsState | None) -> datetime | None:
+    """Extract one snooze timestamp from one parsed thread-tag state."""
+    if state is None:
+        return None
+    snoozed = state.tags.get(SNOOZE_TAG)
+    if snoozed is None:
+        return None
+    return parse_snooze_until(snoozed.data.get("until"))
 
 
 def _parse_tool_result_payload(result: object) -> dict[str, Any] | None:
@@ -137,16 +127,22 @@ def _spawn_snooze_task(
     task: asyncio.Task[None]
 
     async def _runner() -> None:
+        should_forget_task = False
         try:
             delay_seconds = (until - datetime.now(UTC)).total_seconds()
             if delay_seconds > 0:
                 await asyncio.sleep(delay_seconds)
             await wake()
+            should_forget_task = True
         except asyncio.CancelledError:
             logger.info("Cancelled snooze task", room_id=room_id, thread_id=thread_root_id)
+            should_forget_task = True
+            raise
+        except Exception:
+            logger.exception("Snooze task failed", room_id=room_id, thread_id=thread_root_id)
             raise
         finally:
-            if _snooze_tasks.get(key) is task:
+            if should_forget_task and _snooze_tasks.get(key) is task:
                 _snooze_tasks.pop(key, None)
 
     task = asyncio.create_task(_runner(), name=f"thread-snooze:{room_id}:{thread_root_id}")
@@ -155,52 +151,260 @@ def _spawn_snooze_task(
     return task
 
 
-async def _wake_thread(
+def _retry_snooze_wake(
     *,
     room_id: str,
     thread_root_id: str,
     expected_until: datetime,
+    tag_cleared: bool,
     query_room_state: RoomStateQuerier,
     send_message: ThreadMessageSender,
     put_room_state: RoomStatePutter,
     logger: BoundLogger,
 ) -> None:
-    """Wake one snoozed thread by clearing tags and posting a notice."""
-    current_tag = await query_room_state(
+    """Re-arm one wake task after a transient Matrix failure."""
+    retry_at = datetime.now(UTC) + SNOOZE_WAKE_RETRY_DELAY
+    key = (room_id, thread_root_id)
+    if _snooze_tasks.get(key) is asyncio.current_task():
+        _snooze_tasks.pop(key, None)
+
+    async def wake() -> None:
+        await _wake_thread(
+            room_id=room_id,
+            thread_root_id=thread_root_id,
+            expected_until=expected_until,
+            tag_cleared=tag_cleared,
+            query_room_state=query_room_state,
+            send_message=send_message,
+            put_room_state=put_room_state,
+            logger=logger,
+        )
+
+    _spawn_snooze_task(
         room_id,
-        THREAD_TAGS_EVENT_TYPE,
-        _thread_tag_state_key(thread_root_id, SNOOZE_TAG),
+        thread_root_id,
+        retry_at,
+        wake=wake,
+        logger=logger,
     )
-    current_until = _parse_until_from_tag_content(current_tag)
-    normalized_expected_until = expected_until.astimezone(UTC)
-    if current_until != normalized_expected_until:
+
+
+def _should_skip_wake_for_stale_snooze(
+    *,
+    room_id: str,
+    thread_root_id: str,
+    expected_until: datetime,
+    current_until: datetime | None,
+    tag_cleared: bool,
+    logger: BoundLogger,
+) -> bool:
+    """Return whether the wake should be skipped because state no longer matches."""
+    if not tag_cleared and current_until != expected_until:
         logger.info(
             "Skipping stale snooze wake",
             room_id=room_id,
             thread_id=thread_root_id,
-            expected_until=normalized_expected_until.isoformat(),
+            expected_until=expected_until.isoformat(),
             current_until=None if current_until is None else current_until.isoformat(),
         )
+        return True
+
+    if tag_cleared and current_until is not None:
+        logger.info(
+            "Skipping stale snooze wake after prior tag clear",
+            room_id=room_id,
+            thread_id=thread_root_id,
+            expected_until=expected_until.isoformat(),
+            current_until=current_until.isoformat(),
+        )
+        return True
+
+    return False
+
+
+async def _send_snooze_expired_notice(
+    *,
+    room_id: str,
+    thread_root_id: str,
+    expected_until: datetime,
+    tag_cleared: bool,
+    send_message: ThreadMessageSender,
+    query_room_state: RoomStateQuerier,
+    put_room_state: RoomStatePutter,
+    logger: BoundLogger,
+) -> None:
+    """Send the wake notice or reschedule the wake when the send fails."""
+    event_id = await send_message(room_id, SNOOZE_EXPIRED_MESSAGE, thread_root_id)
+    if event_id is not None:
         return
 
-    for tag in (SNOOZE_TAG, RESOLVED_TAG):
-        wrote = await put_room_state(
-            room_id,
-            THREAD_TAGS_EVENT_TYPE,
-            _thread_tag_state_key(thread_root_id, tag),
-            {},
-        )
-        if not wrote:
+    logger.warning(
+        "Failed to send snooze expiry message; scheduling retry",
+        room_id=room_id,
+        thread_id=thread_root_id,
+    )
+    _retry_snooze_wake(
+        room_id=room_id,
+        thread_root_id=thread_root_id,
+        expected_until=expected_until,
+        tag_cleared=tag_cleared,
+        query_room_state=query_room_state,
+        send_message=send_message,
+        put_room_state=put_room_state,
+        logger=logger,
+    )
+
+
+async def _wake_thread(
+    *,
+    room_id: str,
+    thread_root_id: str,
+    expected_until: datetime,
+    tag_cleared: bool = False,
+    query_room_state: RoomStateQuerier,
+    send_message: ThreadMessageSender,
+    put_room_state: RoomStatePutter,
+    logger: BoundLogger,
+) -> None:
+    """Wake one snoozed thread by clearing its tag and posting one notice."""
+    try:
+        room_tags = await query_room_state(room_id, THREAD_TAGS_EVENT_TYPE)
+        if room_tags is None:
             logger.warning(
-                "Failed to clear thread tag during snooze wake",
+                "Failed to query room state during snooze wake; scheduling retry",
                 room_id=room_id,
                 thread_id=thread_root_id,
-                tag=tag,
+            )
+            _retry_snooze_wake(
+                room_id=room_id,
+                thread_root_id=thread_root_id,
+                expected_until=expected_until,
+                tag_cleared=tag_cleared,
+                query_room_state=query_room_state,
+                send_message=send_message,
+                put_room_state=put_room_state,
+                logger=logger,
+            )
+            return
+
+        snoozed_threads = list_tagged_threads_from_state_map(
+            room_id,
+            room_tags,
+            tag=SNOOZE_TAG,
+        )
+        current_until = _snooze_until_from_state(snoozed_threads.get(thread_root_id))
+        normalized_expected_until = expected_until.astimezone(UTC)
+        if _should_skip_wake_for_stale_snooze(
+            room_id=room_id,
+            thread_root_id=thread_root_id,
+            expected_until=normalized_expected_until,
+            current_until=current_until,
+            tag_cleared=tag_cleared,
+            logger=logger,
+        ):
+            return
+
+        if not tag_cleared:
+            expected_state = snoozed_threads.get(thread_root_id)
+            expected_record = expected_state.tags.get(SNOOZE_TAG) if expected_state is not None else None
+
+            async def remove_snooze_tag_state(
+                remove_room_id: str,
+                event_type: str,
+                state_key: str,
+                content: dict[str, object],
+            ) -> bool:
+                nonlocal tag_cleared
+                wrote = await put_room_state(remove_room_id, event_type, state_key, content)
+                if wrote:
+                    tag_cleared = True
+                return wrote
+
+            verified_state = await remove_thread_tag_via_room_state(
+                room_id,
+                thread_root_id,
+                SNOOZE_TAG,
+                query_room_state=query_room_state,
+                put_room_state=remove_snooze_tag_state,
+                expected_record=expected_record,
+            )
+            if verified_state.tags.get(SNOOZE_TAG) is not None:
+                updated_until = _snooze_until_from_state(verified_state)
+                logger.info(
+                    "Skipping stale snooze wake after concurrent update",
+                    room_id=room_id,
+                    thread_id=thread_root_id,
+                    expected_until=normalized_expected_until.isoformat(),
+                    current_until=None if updated_until is None else updated_until.isoformat(),
+                )
+                return
+            tag_cleared = True
+
+        # Remove the resolved tag that was set alongside snooze
+        try:
+            await remove_thread_tag_via_room_state(
+                room_id,
+                thread_root_id,
+                RESOLVED_TAG,
+                query_room_state=query_room_state,
+                put_room_state=put_room_state,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to remove resolved tag during snooze wake",
+                room_id=room_id,
+                thread_id=thread_root_id,
+                tag=RESOLVED_TAG,
+                exc_info=True,
             )
 
-    event_id = await send_message(room_id, SNOOZE_EXPIRED_MESSAGE, thread_root_id)
-    if event_id is None:
-        logger.warning("Failed to send snooze expiry message", room_id=room_id, thread_id=thread_root_id)
+        await _send_snooze_expired_notice(
+            room_id=room_id,
+            thread_root_id=thread_root_id,
+            expected_until=expected_until,
+            tag_cleared=tag_cleared,
+            send_message=send_message,
+            query_room_state=query_room_state,
+            put_room_state=put_room_state,
+            logger=logger,
+        )
+    except ThreadTagsError:
+        logger.warning(
+            "Failed to clear thread tag during snooze wake; scheduling retry",
+            room_id=room_id,
+            thread_id=thread_root_id,
+            tag=SNOOZE_TAG,
+            exc_info=True,
+        )
+        _retry_snooze_wake(
+            room_id=room_id,
+            thread_root_id=thread_root_id,
+            expected_until=expected_until,
+            tag_cleared=tag_cleared,
+            query_room_state=query_room_state,
+            send_message=send_message,
+            put_room_state=put_room_state,
+            logger=logger,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning(
+            "Wake thread hit transport failure; scheduling retry",
+            room_id=room_id,
+            thread_id=thread_root_id,
+            exc_info=True,
+        )
+        _retry_snooze_wake(
+            room_id=room_id,
+            thread_root_id=thread_root_id,
+            expected_until=expected_until,
+            tag_cleared=tag_cleared,
+            query_room_state=query_room_state,
+            send_message=send_message,
+            put_room_state=put_room_state,
+            logger=logger,
+        )
 
 
 def _manual_snooze_tag_target(
@@ -255,16 +459,15 @@ def _manual_snooze_change(ctx: ToolAfterCallContext) -> tuple[dict[str, Any], st
 @hook(
     event="bot:ready",
     name="thread-snooze-resume",
-    agents=(ROUTER_AGENT_NAME,),
     priority=90,
-    timeout_ms=10000,
+    timeout_ms=120000,
 )
-async def resume_snoozed_threads(ctx: AgentLifecycleContext) -> None:
+async def resume_snoozed_threads(ctx: AgentLifecycleContext) -> None:  # noqa: C901
     """Recreate in-process wake timers for all currently snoozed threads."""
     ctx.logger.info(
         "Resuming snoozed threads after bot ready",
         entity_name=ctx.entity_name,
-        room_count=len(ctx.rooms),
+        room_count=len(ctx.joined_room_ids),
     )
     if ctx.room_state_querier is None:
         ctx.logger.warning("No room state querier available for snoozed-thread resume")
@@ -289,18 +492,29 @@ async def resume_snoozed_threads(ctx: AgentLifecycleContext) -> None:
     ) -> dict[str, Any] | None:
         return await ctx.query_room_state(room_id, event_type, state_key)
 
-    for room_id in ctx.rooms:
-        room_tags = await ctx.query_room_state(room_id, THREAD_TAGS_EVENT_TYPE)
+    for room_id in ctx.joined_room_ids:
+        try:
+            room_tags = await ctx.query_room_state(room_id, THREAD_TAGS_EVENT_TYPE)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            ctx.logger.warning(
+                "Failed to scan room state for snoozed threads",
+                room_id=room_id,
+                exc_info=True,
+            )
+            continue
         if room_tags is None:
             ctx.logger.warning("Failed to scan room state for snoozed threads", room_id=room_id)
             continue
 
-        for state_key, content in room_tags.items():
-            thread_root_id = _parse_snoozed_thread_root(state_key)
-            if thread_root_id is None:
-                continue
-
-            until = _parse_until_from_tag_content(content)
+        snoozed_threads = list_tagged_threads_from_state_map(
+            room_id,
+            room_tags,
+            tag=SNOOZE_TAG,
+        )
+        for thread_root_id, thread_state in snoozed_threads.items():
+            until = _snooze_until_from_state(thread_state)
             if until is None:
                 ctx.logger.warning(
                     "Skipping snoozed thread with invalid until timestamp",
