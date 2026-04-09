@@ -61,6 +61,5 @@ When a thread needs attention later but not now, snooze it. The thread is resolv
 
 ## Notes
 
-- This is a pure plugin. No MindRoom core changes are required.
-- Tags are the source of truth. The in-process wake task is disposable and rebuilt after restart.
+- Wake timers are rebuilt after restart from the current snooze tag state.
 - The wake path verifies current tag state before clearing anything, which prevents an old timer from erasing a newer snooze.
