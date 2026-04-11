@@ -9,28 +9,27 @@ from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-import nio
-
 from mindroom.hooks import AgentLifecycleContext, ToolAfterCallContext, hook
 from mindroom.thread_tags import (
+    THREAD_TAGS_EVENT_TYPE,
     ThreadTagsError,
     ThreadTagsState,
-    get_thread_tags,
-    list_tagged_threads,
-    remove_thread_tag,
+    list_tagged_threads_from_state_map,
+    remove_thread_tag_via_room_state,
 )
 
 if TYPE_CHECKING:
     from structlog.stdlib import BoundLogger
 
-    from mindroom.thread_tag_store import ThreadTagStore
-
 SNOOZE_TAG = "snoozed"
+RESOLVED_TAG = "resolved"
 SNOOZE_EXPIRED_MESSAGE = "\u23f0 Snooze expired"
 SNOOZE_WAKE_RETRY_DELAY = timedelta(seconds=30)
 _snooze_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
 
 ThreadMessageSender = Callable[[str, str, str | None], Awaitable[str | None]]
+RoomStateQuerier = Callable[[str, str, str | None], Awaitable[dict[str, Any] | None]]
+RoomStatePutter = Callable[[str, str, str, dict[str, Any]], Awaitable[bool]]
 WakeCallback = Callable[[], Awaitable[None]]
 
 
@@ -158,9 +157,9 @@ def _retry_snooze_wake(
     thread_root_id: str,
     expected_until: datetime,
     tag_cleared: bool,
-    client: nio.AsyncClient,
-    store: ThreadTagStore,
+    query_room_state: RoomStateQuerier,
     send_message: ThreadMessageSender,
+    put_room_state: RoomStatePutter,
     logger: BoundLogger,
 ) -> None:
     """Re-arm one wake task after a transient Matrix failure."""
@@ -175,9 +174,9 @@ def _retry_snooze_wake(
             thread_root_id=thread_root_id,
             expected_until=expected_until,
             tag_cleared=tag_cleared,
-            client=client,
-            store=store,
+            query_room_state=query_room_state,
             send_message=send_message,
+            put_room_state=put_room_state,
             logger=logger,
         )
 
@@ -229,9 +228,9 @@ async def _send_snooze_expired_notice(
     thread_root_id: str,
     expected_until: datetime,
     tag_cleared: bool,
-    client: nio.AsyncClient,
-    store: ThreadTagStore,
     send_message: ThreadMessageSender,
+    query_room_state: RoomStateQuerier,
+    put_room_state: RoomStatePutter,
     logger: BoundLogger,
 ) -> None:
     """Send the wake notice or reschedule the wake when the send fails."""
@@ -249,9 +248,9 @@ async def _send_snooze_expired_notice(
         thread_root_id=thread_root_id,
         expected_until=expected_until,
         tag_cleared=tag_cleared,
-        client=client,
-        store=store,
+        query_room_state=query_room_state,
         send_message=send_message,
+        put_room_state=put_room_state,
         logger=logger,
     )
 
@@ -262,19 +261,38 @@ async def _wake_thread(
     thread_root_id: str,
     expected_until: datetime,
     tag_cleared: bool = False,
-    client: nio.AsyncClient,
-    store: ThreadTagStore,
+    query_room_state: RoomStateQuerier,
     send_message: ThreadMessageSender,
+    put_room_state: RoomStatePutter,
     logger: BoundLogger,
 ) -> None:
     """Wake one snoozed thread by clearing its tag and posting one notice."""
     try:
-        current_until = _snooze_until_from_state(await get_thread_tags(store, room_id, thread_root_id))
-        # Give the sync loop one turn to project a just-arrived resnooze before we clear or notify.
-        await asyncio.sleep(0)
-        refreshed_until = _snooze_until_from_state(await get_thread_tags(store, room_id, thread_root_id))
-        if refreshed_until != current_until:
-            current_until = refreshed_until
+        room_tags = await query_room_state(room_id, THREAD_TAGS_EVENT_TYPE)
+        if room_tags is None:
+            logger.warning(
+                "Failed to query room state during snooze wake; scheduling retry",
+                room_id=room_id,
+                thread_id=thread_root_id,
+            )
+            _retry_snooze_wake(
+                room_id=room_id,
+                thread_root_id=thread_root_id,
+                expected_until=expected_until,
+                tag_cleared=tag_cleared,
+                query_room_state=query_room_state,
+                send_message=send_message,
+                put_room_state=put_room_state,
+                logger=logger,
+            )
+            return
+
+        snoozed_threads = list_tagged_threads_from_state_map(
+            room_id,
+            room_tags,
+            tag=SNOOZE_TAG,
+        )
+        current_until = _snooze_until_from_state(snoozed_threads.get(thread_root_id))
         normalized_expected_until = expected_until.astimezone(UTC)
         if _should_skip_wake_for_stale_snooze(
             room_id=room_id,
@@ -287,12 +305,28 @@ async def _wake_thread(
             return
 
         if not tag_cleared:
-            verified_state = await remove_thread_tag(
-                client,
-                store,
+            expected_state = snoozed_threads.get(thread_root_id)
+            expected_record = expected_state.tags.get(SNOOZE_TAG) if expected_state is not None else None
+
+            async def remove_snooze_tag_state(
+                remove_room_id: str,
+                event_type: str,
+                state_key: str,
+                content: dict[str, object],
+            ) -> bool:
+                nonlocal tag_cleared
+                wrote = await put_room_state(remove_room_id, event_type, state_key, content)
+                if wrote:
+                    tag_cleared = True
+                return wrote
+
+            verified_state = await remove_thread_tag_via_room_state(
                 room_id,
                 thread_root_id,
                 SNOOZE_TAG,
+                query_room_state=query_room_state,
+                put_room_state=remove_snooze_tag_state,
+                expected_record=expected_record,
             )
             if verified_state.tags.get(SNOOZE_TAG) is not None:
                 updated_until = _snooze_until_from_state(verified_state)
@@ -306,14 +340,32 @@ async def _wake_thread(
                 return
             tag_cleared = True
 
+        # Remove the resolved tag that was set alongside snooze
+        try:
+            await remove_thread_tag_via_room_state(
+                room_id,
+                thread_root_id,
+                RESOLVED_TAG,
+                query_room_state=query_room_state,
+                put_room_state=put_room_state,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to remove resolved tag during snooze wake",
+                room_id=room_id,
+                thread_id=thread_root_id,
+                tag=RESOLVED_TAG,
+                exc_info=True,
+            )
+
         await _send_snooze_expired_notice(
             room_id=room_id,
             thread_root_id=thread_root_id,
             expected_until=expected_until,
             tag_cleared=tag_cleared,
-            client=client,
-            store=store,
             send_message=send_message,
+            query_room_state=query_room_state,
+            put_room_state=put_room_state,
             logger=logger,
         )
     except ThreadTagsError:
@@ -329,9 +381,9 @@ async def _wake_thread(
             thread_root_id=thread_root_id,
             expected_until=expected_until,
             tag_cleared=tag_cleared,
-            client=client,
-            store=store,
+            query_room_state=query_room_state,
             send_message=send_message,
+            put_room_state=put_room_state,
             logger=logger,
         )
     except asyncio.CancelledError:
@@ -348,9 +400,9 @@ async def _wake_thread(
             thread_root_id=thread_root_id,
             expected_until=expected_until,
             tag_cleared=tag_cleared,
-            client=client,
-            store=store,
+            query_room_state=query_room_state,
             send_message=send_message,
+            put_room_state=put_room_state,
             logger=logger,
         )
 
@@ -417,11 +469,11 @@ async def resume_snoozed_threads(ctx: AgentLifecycleContext) -> None:  # noqa: C
         entity_name=ctx.entity_name,
         room_count=len(ctx.joined_room_ids),
     )
-    if ctx.thread_tag_store is None:
-        ctx.logger.warning("No thread tag store available for snoozed-thread resume")
+    if ctx.room_state_querier is None:
+        ctx.logger.warning("No room state querier available for snoozed-thread resume")
         return
-    if ctx.matrix_client is None:
-        ctx.logger.warning("No Matrix client available for snoozed-thread resume")
+    if ctx.room_state_putter is None:
+        ctx.logger.warning("No room state putter available for snoozed-thread resume")
         return
     if ctx.message_sender is None:
         ctx.logger.warning("No message sender available for snoozed-thread resume")
@@ -430,18 +482,37 @@ async def resume_snoozed_threads(ctx: AgentLifecycleContext) -> None:  # noqa: C
     async def send_message(room_id: str, text: str, thread_id: str | None) -> str | None:
         return await ctx.send_message(room_id, text, thread_id=thread_id)
 
+    async def put_room_state(room_id: str, event_type: str, state_key: str, content: dict[str, Any]) -> bool:
+        return await ctx.put_room_state(room_id, event_type, state_key, content)
+
+    async def query_room_state(
+        room_id: str,
+        event_type: str,
+        state_key: str | None = None,
+    ) -> dict[str, Any] | None:
+        return await ctx.query_room_state(room_id, event_type, state_key)
+
     for room_id in ctx.joined_room_ids:
         try:
-            snoozed_threads = await list_tagged_threads(ctx.thread_tag_store, room_id, tag=SNOOZE_TAG)
+            room_tags = await ctx.query_room_state(room_id, THREAD_TAGS_EVENT_TYPE)
         except asyncio.CancelledError:
             raise
         except Exception:
             ctx.logger.warning(
-                "Failed to scan thread tag store for snoozed threads",
+                "Failed to scan room state for snoozed threads",
                 room_id=room_id,
                 exc_info=True,
             )
             continue
+        if room_tags is None:
+            ctx.logger.warning("Failed to scan room state for snoozed threads", room_id=room_id)
+            continue
+
+        snoozed_threads = list_tagged_threads_from_state_map(
+            room_id,
+            room_tags,
+            tag=SNOOZE_TAG,
+        )
         for thread_root_id, thread_state in snoozed_threads.items():
             until = _snooze_until_from_state(thread_state)
             if until is None:
@@ -462,9 +533,9 @@ async def resume_snoozed_threads(ctx: AgentLifecycleContext) -> None:  # noqa: C
                     room_id=_room_id,
                     thread_root_id=_thread_root_id,
                     expected_until=_until,
-                    client=ctx.matrix_client,
-                    store=ctx.thread_tag_store,
+                    query_room_state=query_room_state,
                     send_message=send_message,
+                    put_room_state=put_room_state,
                     logger=ctx.logger,
                 )
 
@@ -492,25 +563,28 @@ async def schedule_manual_snooze_tag(ctx: ToolAfterCallContext) -> None:
     until = _manual_snooze_tag_until(payload, ctx.arguments)
     if until is None:
         return
-    if ctx.matrix_client is None or ctx.thread_tag_store is None:
-        ctx.logger.warning(
-            "Skipping snooze wake scheduling because runtime dependencies are unavailable",
-            room_id=room_id,
-            thread_id=thread_root_id,
-        )
-        return
 
     async def send_message(target_room_id: str, text: str, thread_id: str | None) -> str | None:
         return await ctx.send_message(target_room_id, text, thread_id=thread_id)
+
+    async def put_room_state(target_room_id: str, event_type: str, state_key: str, content: dict[str, Any]) -> bool:
+        return await ctx.put_room_state(target_room_id, event_type, state_key, content)
+
+    async def query_room_state(
+        target_room_id: str,
+        event_type: str,
+        state_key: str | None = None,
+    ) -> dict[str, Any] | None:
+        return await ctx.query_room_state(target_room_id, event_type, state_key)
 
     async def wake() -> None:
         await _wake_thread(
             room_id=room_id,
             thread_root_id=thread_root_id,
             expected_until=until,
-            client=ctx.matrix_client,
-            store=ctx.thread_tag_store,
+            query_room_state=query_room_state,
             send_message=send_message,
+            put_room_state=put_room_state,
             logger=ctx.logger,
         )
 

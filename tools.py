@@ -83,7 +83,23 @@ def _build_wake_bindings(context: ToolRuntimeContext) -> tuple[Any, Any, Any]:
             trigger_dispatch=False,
         )
 
-    return send_message, context.client, context.tag_store
+    async def put_room_state(room_id: str, event_type: str, state_key: str, content: dict[str, Any]) -> bool:
+        if bindings.room_state_putter is None:
+            LOGGER.warning("No room state putter available for snooze wake", room_id=room_id, state_key=state_key)
+            return False
+        return await bindings.room_state_putter(room_id, event_type, state_key, content)
+
+    async def query_room_state(
+        room_id: str,
+        event_type: str,
+        state_key: str | None = None,
+    ) -> dict[str, Any] | None:
+        if bindings.room_state_querier is None:
+            LOGGER.warning("No room state querier available for snooze wake", room_id=room_id, state_key=state_key)
+            return None
+        return await bindings.room_state_querier(room_id, event_type, state_key)
+
+    return send_message, put_room_state, query_room_state
 
 
 def _schedule_snooze_wake(
@@ -94,19 +110,16 @@ def _schedule_snooze_wake(
     until: datetime,
 ) -> None:
     hooks_module = _hooks_module()
-    send_message, client, tag_store = _build_wake_bindings(context)
-    if tag_store is None:
-        msg = "Thread tag store is unavailable for snooze wake scheduling."
-        raise RuntimeError(msg)
+    send_message, put_room_state, query_room_state = _build_wake_bindings(context)
 
     async def wake() -> None:
         await hooks_module._wake_thread(
             room_id=room_id,
             thread_root_id=thread_root_id,
             expected_until=until,
-            client=client,
-            store=tag_store,
+            query_room_state=query_room_state,
             send_message=send_message,
+            put_room_state=put_room_state,
             logger=LOGGER,
         )
 
@@ -132,13 +145,20 @@ class ThreadSnoozeTools(Toolkit):
             tools=[self.snooze_thread, self.unsnooze_thread],
         )
 
-    async def snooze_thread(self, until: str, note: str | None = None) -> str:  # noqa: PLR0911
-        """Snooze the current thread until an exact future datetime."""
+    async def snooze_thread(self, until: str, note: str | None = None) -> str:
+        """Snooze the current thread until an exact future ISO-8601 datetime.
+
+        Args:
+            until: ISO-8601 datetime string for when to wake the thread.
+                Must be in the future. Include timezone offset or use 'Z' for UTC.
+                Naive datetimes (no timezone) are treated as UTC.
+                Examples: '2026-04-10T14:00:00Z', '2026-04-10T09:00:00-07:00',
+                '2026-04-11T18:30:00+02:00'.
+            note: Optional note explaining why the thread was snoozed.
+        """
         context = get_tool_runtime_context()
         if context is None:
             return _context_error("snooze", message="Thread snooze tool context is unavailable in this runtime path.")
-        if context.tag_store is None:
-            return _context_error("snooze", message="Thread tag store is unavailable in this runtime path.")
 
         try:
             room_id, thread_root_id = _resolved_scope(context)
@@ -148,6 +168,7 @@ class ThreadSnoozeTools(Toolkit):
         hooks_module = _hooks_module()
         parsed_until = hooks_module.parse_snooze_until(until)
         snooze_tag = hooks_module.SNOOZE_TAG
+        resolved_tag = hooks_module.RESOLVED_TAG
         if parsed_until is None:
             return _context_error("snooze", message="until must be an ISO-8601 datetime.")
         if parsed_until <= datetime.now(UTC):
@@ -156,9 +177,8 @@ class ThreadSnoozeTools(Toolkit):
         snooze_data = {"until": parsed_until.isoformat()}
 
         try:
-            final_state = await set_thread_tag(
+            await set_thread_tag(
                 context.client,
-                context.tag_store,
                 room_id,
                 thread_root_id,
                 snooze_tag,
@@ -166,33 +186,22 @@ class ThreadSnoozeTools(Toolkit):
                 note=note,
                 data=snooze_data,
             )
+            final_state = await set_thread_tag(
+                context.client,
+                room_id,
+                thread_root_id,
+                resolved_tag,
+                set_by=context.requester_id,
+            )
         except ThreadTagsError as exc:
             return _context_error("snooze", message=str(exc))
 
-        try:
-            _schedule_snooze_wake(
-                context,
-                room_id=room_id,
-                thread_root_id=thread_root_id,
-                until=parsed_until,
-            )
-        except Exception as exc:
-            try:
-                await remove_thread_tag(
-                    context.client,
-                    context.tag_store,
-                    room_id,
-                    thread_root_id,
-                    snooze_tag,
-                    requester_user_id=context.requester_id,
-                )
-            except ThreadTagsError:
-                LOGGER.exception(
-                    "Failed to roll back snooze tag after wake scheduling failure",
-                    room_id=room_id,
-                    thread_id=thread_root_id,
-                )
-            return _context_error("snooze", message=f"Failed to schedule snooze wake: {exc}")
+        _schedule_snooze_wake(
+            context,
+            room_id=room_id,
+            thread_root_id=thread_root_id,
+            until=parsed_until,
+        )
 
         return _payload(
             "ok",
@@ -208,8 +217,6 @@ class ThreadSnoozeTools(Toolkit):
         context = get_tool_runtime_context()
         if context is None:
             return _context_error("unsnooze", message="Thread snooze tool context is unavailable in this runtime path.")
-        if context.tag_store is None:
-            return _context_error("unsnooze", message="Thread tag store is unavailable in this runtime path.")
 
         try:
             room_id, thread_root_id = _resolved_scope(context)
@@ -217,28 +224,36 @@ class ThreadSnoozeTools(Toolkit):
             return _context_error("unsnooze", message=str(exc))
 
         try:
-            existing_state = await get_thread_tags(context.tag_store, room_id, thread_root_id)
+            existing_state = await get_thread_tags(context.client, room_id, thread_root_id)
         except ThreadTagsError as exc:
             return _context_error("unsnooze", message=str(exc))
 
         hooks_module = _hooks_module()
         snooze_tag = hooks_module.SNOOZE_TAG
+        resolved_tag = hooks_module.RESOLVED_TAG
         if existing_state is None or snooze_tag not in existing_state.tags:
             return _context_error("unsnooze", message="Thread is not snoozed.")
+
+        hooks_module._cancel_snooze_task(room_id, thread_root_id)
 
         try:
             final_state = await remove_thread_tag(
                 context.client,
-                context.tag_store,
                 room_id,
                 thread_root_id,
                 snooze_tag,
                 requester_user_id=context.requester_id,
             )
+            if resolved_tag in final_state.tags:
+                final_state = await remove_thread_tag(
+                    context.client,
+                    room_id,
+                    thread_root_id,
+                    resolved_tag,
+                    requester_user_id=context.requester_id,
+                )
         except ThreadTagsError as exc:
             return _context_error("unsnooze", message=str(exc))
-
-        hooks_module._cancel_snooze_task(room_id, thread_root_id)
 
         return _payload(
             "ok",
