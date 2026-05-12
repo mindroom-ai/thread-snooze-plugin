@@ -12,11 +12,94 @@ from typing import TYPE_CHECKING, Any
 from mindroom.hooks import AgentLifecycleContext, ToolAfterCallContext, hook
 from mindroom.thread_tags import (
     THREAD_TAGS_EVENT_TYPE,
+    ThreadTagRecord,
     ThreadTagsError,
     ThreadTagsState,
-    list_tagged_threads_from_state_map,
-    remove_thread_tag_via_room_state,
+    normalize_tag_name,
 )
+
+
+def _thread_tag_state_key(thread_root_id: str, tag: str) -> str:
+    return json.dumps([thread_root_id, tag], separators=(",", ":"))
+
+
+def _snoozed_thread_id_from_state_key(state_key: object) -> str | None:
+    if not isinstance(state_key, str):
+        return None
+    try:
+        value = json.loads(state_key)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or not isinstance(value[0], str)
+        or value[1] != SNOOZE_TAG
+    ):
+        return None
+    return value[0]
+
+
+def _parse_tag_record(tag: str, content: object) -> ThreadTagRecord | None:
+    if not isinstance(content, Mapping) or not content:
+        return None
+    try:
+        normalize_tag_name(tag)
+        return ThreadTagRecord.model_validate(content)
+    except (ThreadTagsError, TypeError, ValueError):
+        return None
+
+
+def _snoozed_threads_from_state_map(
+    room_id: str,
+    room_state: Mapping[object, object],
+) -> dict[str, ThreadTagsState]:
+    """Return snoozed thread states from a pre-fetched room-state map."""
+    states: dict[str, ThreadTagsState] = {}
+    for state_key, content in room_state.items():
+        thread_root_id = _snoozed_thread_id_from_state_key(state_key)
+        if thread_root_id is None:
+            continue
+        record = _parse_tag_record(SNOOZE_TAG, content)
+        if record is not None:
+            states[thread_root_id] = ThreadTagsState(
+                room_id=room_id,
+                thread_root_id=thread_root_id,
+                tags={SNOOZE_TAG: record},
+            )
+    return states
+
+
+def _records_match(expected: ThreadTagRecord, actual: ThreadTagRecord | None) -> bool:
+    if actual is None:
+        return False
+    return expected.model_dump(mode="json", exclude_none=True) == actual.model_dump(mode="json", exclude_none=True)
+
+
+async def _clear_thread_tag_via_room_state(
+    room_id: str,
+    thread_root_id: str,
+    tag: str,
+    *,
+    query_room_state: RoomStateQuerier,
+    put_room_state: RoomStatePutter,
+    expected_record: ThreadTagRecord | None = None,
+) -> ThreadTagsState:
+    """Clear one per-tag thread state event using hook room-state bindings."""
+    normalized_tag = normalize_tag_name(tag)
+    state_key = _thread_tag_state_key(thread_root_id, normalized_tag)
+    current_content = await query_room_state(room_id, THREAD_TAGS_EVENT_TYPE, state_key)
+    current_record = _parse_tag_record(normalized_tag, current_content)
+    if expected_record is not None and not _records_match(expected_record, current_record):
+        return ThreadTagsState(
+            room_id=room_id,
+            thread_root_id=thread_root_id,
+            tags={} if current_record is None else {normalized_tag: current_record},
+        )
+    if not await put_room_state(room_id, THREAD_TAGS_EVENT_TYPE, state_key, {}):
+        msg = f"Failed to update thread tags state for {thread_root_id} tag {normalized_tag!r} in {room_id}."
+        raise ThreadTagsError(msg)
+    return ThreadTagsState(room_id=room_id, thread_root_id=thread_root_id, tags={})
 
 if TYPE_CHECKING:
     from structlog.stdlib import BoundLogger
@@ -255,7 +338,7 @@ async def _send_snooze_expired_notice(
     )
 
 
-async def _wake_thread(
+async def _wake_thread(  # noqa: C901
     *,
     room_id: str,
     thread_root_id: str,
@@ -287,10 +370,9 @@ async def _wake_thread(
             )
             return
 
-        snoozed_threads = list_tagged_threads_from_state_map(
+        snoozed_threads = _snoozed_threads_from_state_map(
             room_id,
             room_tags,
-            tag=SNOOZE_TAG,
         )
         current_until = _snooze_until_from_state(snoozed_threads.get(thread_root_id))
         normalized_expected_until = expected_until.astimezone(UTC)
@@ -320,7 +402,7 @@ async def _wake_thread(
                     tag_cleared = True
                 return wrote
 
-            verified_state = await remove_thread_tag_via_room_state(
+            verified_state = await _clear_thread_tag_via_room_state(
                 room_id,
                 thread_root_id,
                 SNOOZE_TAG,
@@ -342,7 +424,7 @@ async def _wake_thread(
 
         # Remove the resolved tag that was set alongside snooze
         try:
-            await remove_thread_tag_via_room_state(
+            await _clear_thread_tag_via_room_state(
                 room_id,
                 thread_root_id,
                 RESOLVED_TAG,
@@ -508,10 +590,9 @@ async def resume_snoozed_threads(ctx: AgentLifecycleContext) -> None:  # noqa: C
             ctx.logger.warning("Failed to scan room state for snoozed threads", room_id=room_id)
             continue
 
-        snoozed_threads = list_tagged_threads_from_state_map(
+        snoozed_threads = _snoozed_threads_from_state_map(
             room_id,
             room_tags,
-            tag=SNOOZE_TAG,
         )
         for thread_root_id, thread_state in snoozed_threads.items():
             until = _snooze_until_from_state(thread_state)
