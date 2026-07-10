@@ -14,18 +14,19 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-import mindroom.tool_system.plugins as plugin_module
+import mindroom.tool_system.plugin_imports as plugin_imports
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
-from mindroom.constants import ROUTER_AGENT_NAME
+from mindroom.constants import ROUTER_AGENT_NAME, resolve_runtime_paths
 from mindroom.hooks import AgentLifecycleContext, HookRegistry, ToolAfterCallContext
 from mindroom.logging_config import get_logger
+from mindroom.message_target import MessageTarget
 from mindroom.thread_tags import ThreadTagRecord, ThreadTagsState
-from mindroom.tool_system.metadata import _TOOL_REGISTRY, TOOL_METADATA, get_tool_by_name
+from mindroom.tool_system.metadata import get_tool_by_name
 from mindroom.tool_system.plugins import load_plugins
+from mindroom.tool_system.registry_state import TOOL_METADATA, TOOL_REGISTRY
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
 from mindroom.tool_system.skills import _get_plugin_skill_roots, set_plugin_skill_roots
-from tests.conftest import bind_runtime_paths, runtime_paths_for, test_runtime_paths
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -45,12 +46,14 @@ class _LoadedThreadSnooze:
 
 
 def _plugin_root() -> Path:
-    return Path(__file__).resolve().parents[1] / "plugins" / "thread-snooze"
+    return Path(__file__).resolve().parents[1]
 
 
 def _copy_plugin_root(tmp_path: Path) -> Path:
     copied_root = tmp_path / "plugins" / "thread-snooze"
-    shutil.copytree(_plugin_root(), copied_root)
+    copied_root.mkdir(parents=True)
+    for filename in ("hooks.py", "mindroom.plugin.json", "tools.py"):
+        shutil.copy2(_plugin_root() / filename, copied_root / filename)
     return copied_root
 
 
@@ -83,15 +86,20 @@ def _tool_context(
 ) -> ToolRuntimeContext:
     return ToolRuntimeContext(
         agent_name="code",
-        room_id="!room:localhost",
-        thread_id=thread_id,
-        resolved_thread_id=resolved_thread_id,
+        target=MessageTarget(
+            room_id="!room:localhost",
+            source_thread_id=thread_id,
+            resolved_thread_id=resolved_thread_id,
+            reply_to_event_id=None,
+            session_id="session-1",
+        ),
         requester_id="@user:localhost",
         client=AsyncMock(),
         config=loaded.config,
         runtime_paths=loaded.runtime_paths,
+        event_cache=AsyncMock(),
+        conversation_cache=AsyncMock(),
         room=MagicMock(),
-        reply_to_event_id=None,
         storage_path=None,
         hook_message_sender=AsyncMock(return_value="$hook-event"),
         correlation_id="corr-thread-snooze-tool",
@@ -121,6 +129,7 @@ def _ready_context(
         entity_type="agent",
         rooms=rooms,
         matrix_user_id="@mindroom_code:localhost",
+        joined_room_ids=rooms,
     )
 
 
@@ -157,49 +166,53 @@ def _after_call_context(
 @pytest.fixture
 def loaded_thread_snooze(tmp_path: Path) -> Generator[_LoadedThreadSnooze, None, None]:
     """Load the thread-snooze plugin into an isolated runtime rooted at tmp_path."""
-    runtime_paths = test_runtime_paths(tmp_path)
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "mindroom_data",
+        process_env={
+            "MATRIX_HOMESERVER": "http://localhost:8008",
+            "MINDROOM_NAMESPACE": "",
+        },
+    )
     plugin_root = _copy_plugin_root(tmp_path)
-    config = bind_runtime_paths(
-        Config(
-            agents={"code": AgentConfig(display_name="Code", rooms=["!room:localhost"])},
-            plugins=[str(plugin_root)],
-        ),
-        runtime_paths,
+    config = Config(
+        agents={"code": AgentConfig(display_name="Code", rooms=["!room:localhost"])},
+        plugins=[str(plugin_root)],
     )
 
-    original_registry = _TOOL_REGISTRY.copy()
+    original_registry = TOOL_REGISTRY.copy()
     original_metadata = TOOL_METADATA.copy()
     original_plugin_roots = _get_plugin_skill_roots()
-    original_plugin_cache = plugin_module._PLUGIN_CACHE.copy()
-    original_module_cache = plugin_module._MODULE_IMPORT_CACHE.copy()
+    original_plugin_cache = plugin_imports._PLUGIN_CACHE.copy()
+    original_module_cache = plugin_imports._MODULE_IMPORT_CACHE.copy()
 
     try:
-        plugins = load_plugins(config, runtime_paths_for(config))
+        plugins = load_plugins(config, runtime_paths)
         registry = HookRegistry.from_plugins(plugins)
-        hooks_module = plugin_module._MODULE_IMPORT_CACHE[plugin_root / "hooks.py"].module
-        tools_module = plugin_module._MODULE_IMPORT_CACHE[plugin_root / "tools.py"].module
+        hooks_module = plugin_imports._MODULE_IMPORT_CACHE[plugin_root / "hooks.py"].module
+        tools_module = plugin_imports._MODULE_IMPORT_CACHE[plugin_root / "tools.py"].module
         yield _LoadedThreadSnooze(
             config=config,
-            runtime_paths=runtime_paths_for(config),
+            runtime_paths=runtime_paths,
             registry=registry,
             plugin_root=plugin_root,
             hooks_module=hooks_module,
             tools_module=tools_module,
         )
     finally:
-        hooks_module = plugin_module._MODULE_IMPORT_CACHE.get(plugin_root / "hooks.py")
+        hooks_module = plugin_imports._MODULE_IMPORT_CACHE.get(plugin_root / "hooks.py")
         if hooks_module is not None:
             for task in list(hooks_module.module._snooze_tasks.values()):
                 task.cancel()
             hooks_module.module._snooze_tasks.clear()
-        _TOOL_REGISTRY.clear()
-        _TOOL_REGISTRY.update(original_registry)
+        TOOL_REGISTRY.clear()
+        TOOL_REGISTRY.update(original_registry)
         TOOL_METADATA.clear()
         TOOL_METADATA.update(original_metadata)
-        plugin_module._PLUGIN_CACHE.clear()
-        plugin_module._PLUGIN_CACHE.update(original_plugin_cache)
-        plugin_module._MODULE_IMPORT_CACHE.clear()
-        plugin_module._MODULE_IMPORT_CACHE.update(original_module_cache)
+        plugin_imports._PLUGIN_CACHE.clear()
+        plugin_imports._PLUGIN_CACHE.update(original_plugin_cache)
+        plugin_imports._MODULE_IMPORT_CACHE.clear()
+        plugin_imports._MODULE_IMPORT_CACHE.update(original_module_cache)
         set_plugin_skill_roots(original_plugin_roots)
 
 
@@ -318,7 +331,15 @@ async def test_cancelled_snooze_task_does_not_wake(loaded_thread_snooze: _Loaded
 async def test_wake_thread_clears_tags_and_notifies(loaded_thread_snooze: _LoadedThreadSnooze) -> None:
     hooks = loaded_thread_snooze.hooks_module
     until = datetime(2026, 4, 10, 9, 0, tzinfo=UTC)
-    query_room_state = AsyncMock(return_value={"data": {"until": until.isoformat()}})
+    snoozed_key = json.dumps(["$thread-root", "snoozed"], separators=(",", ":"))
+    snoozed_record = _record(data={"until": until.isoformat()}).model_dump(mode="json", exclude_none=True)
+    query_room_state = AsyncMock(
+        side_effect=[
+            {snoozed_key: snoozed_record},
+            snoozed_record,
+            _record().model_dump(mode="json", exclude_none=True),
+        ],
+    )
     put_room_state = AsyncMock(return_value=True)
     send_message = AsyncMock(return_value="$wake")
 
@@ -350,25 +371,29 @@ async def test_wake_thread_clears_tags_and_notifies(loaded_thread_snooze: _Loade
 
 
 @pytest.mark.asyncio
-async def test_wake_thread_continues_after_room_state_failures(loaded_thread_snooze: _LoadedThreadSnooze) -> None:
+async def test_wake_thread_retries_after_snooze_state_failure(loaded_thread_snooze: _LoadedThreadSnooze) -> None:
     hooks = loaded_thread_snooze.hooks_module
     until = datetime(2026, 4, 10, 9, 0, tzinfo=UTC)
-    query_room_state = AsyncMock(return_value={"data": {"until": until.isoformat()}})
-    put_room_state = AsyncMock(side_effect=[False, False])
+    snoozed_key = json.dumps(["$thread-root", "snoozed"], separators=(",", ":"))
+    snoozed_record = _record(data={"until": until.isoformat()}).model_dump(mode="json", exclude_none=True)
+    query_room_state = AsyncMock(side_effect=[{snoozed_key: snoozed_record}, snoozed_record])
+    put_room_state = AsyncMock(return_value=False)
     send_message = AsyncMock(return_value=None)
 
-    await hooks._wake_thread(
-        room_id="!room:localhost",
-        thread_root_id="$thread-root",
-        expected_until=until,
-        query_room_state=query_room_state,
-        send_message=send_message,
-        put_room_state=put_room_state,
-        logger=get_logger("tests.thread_snooze"),
-    )
+    with patch.object(hooks, "_retry_snooze_wake") as retry:
+        await hooks._wake_thread(
+            room_id="!room:localhost",
+            thread_root_id="$thread-root",
+            expected_until=until,
+            query_room_state=query_room_state,
+            send_message=send_message,
+            put_room_state=put_room_state,
+            logger=get_logger("tests.thread_snooze"),
+        )
 
-    assert put_room_state.await_count == 2
-    send_message.assert_awaited_once_with("!room:localhost", "\u23f0 Snooze expired", "$thread-root")
+    put_room_state.assert_awaited_once()
+    send_message.assert_not_awaited()
+    retry.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -376,7 +401,15 @@ async def test_wake_thread_skips_stale_snooze_state(loaded_thread_snooze: _Loade
     hooks = loaded_thread_snooze.hooks_module
     original_until = datetime(2026, 4, 10, 9, 0, tzinfo=UTC)
     newer_until = original_until + timedelta(hours=1)
-    query_room_state = AsyncMock(return_value={"data": {"until": newer_until.isoformat()}})
+    snoozed_key = json.dumps(["$thread-root", "snoozed"], separators=(",", ":"))
+    query_room_state = AsyncMock(
+        return_value={
+            snoozed_key: _record(data={"until": newer_until.isoformat()}).model_dump(
+                mode="json",
+                exclude_none=True,
+            ),
+        },
+    )
     put_room_state = AsyncMock(return_value=True)
     send_message = AsyncMock(return_value="$wake")
 
@@ -399,9 +432,9 @@ async def test_bot_ready_rescans_future_snoozes(loaded_thread_snooze: _LoadedThr
     until = datetime.now(UTC) + timedelta(hours=1)
     room_state_querier = AsyncMock(
         return_value={
-            json.dumps(["$thread-root", "snoozed"], separators=(",", ":")): {
-                "data": {"until": until.isoformat()},
-            },
+            json.dumps(["$thread-root", "snoozed"], separators=(",", ":")): _record(
+                data={"until": until.isoformat()},
+            ).model_dump(mode="json", exclude_none=True),
         },
     )
     ctx = _ready_context(
@@ -423,9 +456,9 @@ async def test_bot_ready_fires_expired_snoozes_immediately(loaded_thread_snooze:
     until = datetime.now(UTC) - timedelta(seconds=1)
     room_state_querier = AsyncMock(
         return_value={
-            json.dumps(["$thread-root", "snoozed"], separators=(",", ":")): {
-                "data": {"until": until.isoformat()},
-            },
+            json.dumps(["$thread-root", "snoozed"], separators=(",", ":")): _record(
+                data={"until": until.isoformat()},
+            ).model_dump(mode="json", exclude_none=True),
         },
     )
     ctx = _ready_context(
@@ -446,9 +479,9 @@ async def test_bot_ready_fires_expired_snoozes_immediately(loaded_thread_snooze:
 async def test_bot_ready_skips_invalid_until_values(loaded_thread_snooze: _LoadedThreadSnooze) -> None:
     room_state_querier = AsyncMock(
         return_value={
-            json.dumps(["$thread-root", "snoozed"], separators=(",", ":")): {
-                "data": {"until": "not-a-date"},
-            },
+            json.dumps(["$thread-root", "snoozed"], separators=(",", ":")): _record(
+                data={"until": "not-a-date"},
+            ).model_dump(mode="json", exclude_none=True),
         },
     )
     ctx = _ready_context(

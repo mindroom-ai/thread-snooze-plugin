@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.hooks import AgentLifecycleContext, ToolAfterCallContext, hook
 from mindroom.thread_tags import (
     THREAD_TAGS_EVENT_TYPE,
@@ -543,6 +544,7 @@ def _manual_snooze_change(ctx: ToolAfterCallContext) -> tuple[dict[str, Any], st
     name="thread-snooze-resume",
     priority=90,
     timeout_ms=120000,
+    agents=(ROUTER_AGENT_NAME,),
 )
 async def resume_snoozed_threads(ctx: AgentLifecycleContext) -> None:  # noqa: C901
     """Recreate in-process wake timers for all currently snoozed threads."""

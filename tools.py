@@ -17,12 +17,12 @@ from mindroom.thread_tags import (
     remove_thread_tag,
     set_thread_tag,
 )
-from mindroom.tool_system.metadata import (
+from mindroom.tool_system.declarations import (
     SetupType,
     ToolCategory,
     ToolStatus,
-    register_tool_with_metadata,
 )
+from mindroom.tool_system.registration import register_tool_with_metadata
 from mindroom.tool_system.runtime_context import (
     ToolRuntimeContext,
     get_tool_runtime_context,
