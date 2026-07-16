@@ -48,6 +48,31 @@ When a thread needs attention later but not now, snooze it. The thread is resolv
 - Stored wake times are normalized to UTC
 - The `resolved` tag is also added while the thread is snoozed
 
+## Install
+
+Vendor this plugin with the MindRoom CLI:
+
+```bash
+mindroom plugins install thread-snooze-plugin
+```
+
+Then reference it from `config.yaml`:
+
+```yaml
+plugins:
+  - path: plugins/thread-snooze-plugin
+```
+
+Update to the latest commit later with:
+
+```bash
+mindroom plugins update thread-snooze-plugin
+```
+
+The command pins the exact installed commit in `.mindroom-plugin.lock.json` and strictly validates the plugin before activating it.
+It requires a MindRoom release newer than v2026.7.175.
+For a manual checkout instead, see Setup below.
+
 ## Setup
 
 1. Copy this plugin to `~/.mindroom/plugins/thread-snooze`.
