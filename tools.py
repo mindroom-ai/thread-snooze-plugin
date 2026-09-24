@@ -20,6 +20,7 @@ from mindroom.thread_tags import (
 from mindroom.tool_system.declarations import (
     SetupType,
     ToolCategory,
+    ToolFileAccess,
     ToolStatus,
 )
 from mindroom.tool_system.registration import register_tool_with_metadata
@@ -266,6 +267,7 @@ class ThreadSnoozeTools(Toolkit):
 
 @register_tool_with_metadata(
     name="thread_snooze",
+    file_access=ToolFileAccess.NONE,
     display_name="Thread Snooze",
     description="Snooze the current thread until an exact future datetime and wake it automatically.",
     category=ToolCategory.PRODUCTIVITY,
