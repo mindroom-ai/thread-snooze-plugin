@@ -26,7 +26,7 @@ from mindroom.tool_system.metadata import get_tool_by_name
 from mindroom.tool_system.plugins import load_plugins
 from mindroom.tool_system.registry_state import TOOL_METADATA, TOOL_REGISTRY
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
-from mindroom.tool_system.skills import _get_plugin_skill_roots, set_plugin_skill_roots
+from mindroom.tool_system.skills import get_plugin_skill_roots, set_plugin_skill_roots
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -198,7 +198,7 @@ def loaded_thread_snooze(tmp_path: Path) -> Generator[_LoadedThreadSnooze, None,
 
     original_registry = TOOL_REGISTRY.copy()
     original_metadata = TOOL_METADATA.copy()
-    original_plugin_roots = _get_plugin_skill_roots()
+    original_plugin_roots = get_plugin_skill_roots()
     original_plugin_cache = plugin_imports._PLUGIN_CACHE.copy()
     original_module_cache = plugin_imports._MODULE_IMPORT_CACHE.copy()
 
