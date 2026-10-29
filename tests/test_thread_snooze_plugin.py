@@ -74,6 +74,16 @@ def _copy_plugin_root(tmp_path: Path) -> Path:
     return copied_root
 
 
+def _loaded_plugin_module(module_path: Path) -> ModuleType:
+    """Return the one loaded plugin module executed from a file, whatever the module cache is keyed by."""
+    (module,) = (
+        cached.module
+        for cached in plugin_imports._MODULE_IMPORT_CACHE.values()
+        if cached.module.__file__ == str(module_path)
+    )
+    return module
+
+
 def _record(
     *,
     note: str | None = None,
@@ -202,11 +212,12 @@ def loaded_thread_snooze(tmp_path: Path) -> Generator[_LoadedThreadSnooze, None,
     original_plugin_cache = plugin_imports._PLUGIN_CACHE.copy()
     original_module_cache = plugin_imports._MODULE_IMPORT_CACHE.copy()
 
+    hooks_module: ModuleType | None = None
     try:
         plugins = load_plugins(config, runtime_paths)
         registry = HookRegistry.from_plugins(plugins)
-        hooks_module = plugin_imports._MODULE_IMPORT_CACHE[plugin_root / "hooks.py"].module
-        tools_module = plugin_imports._MODULE_IMPORT_CACHE[plugin_root / "tools.py"].module
+        hooks_module = _loaded_plugin_module(plugin_root / "hooks.py")
+        tools_module = _loaded_plugin_module(plugin_root / "tools.py")
         yield _LoadedThreadSnooze(
             config=config,
             runtime_paths=runtime_paths,
@@ -216,11 +227,10 @@ def loaded_thread_snooze(tmp_path: Path) -> Generator[_LoadedThreadSnooze, None,
             tools_module=tools_module,
         )
     finally:
-        hooks_module = plugin_imports._MODULE_IMPORT_CACHE.get(plugin_root / "hooks.py")
         if hooks_module is not None:
-            for task in list(hooks_module.module._snooze_tasks.values()):
+            for task in list(hooks_module._snooze_tasks.values()):
                 task.cancel()
-            hooks_module.module._snooze_tasks.clear()
+            hooks_module._snooze_tasks.clear()
         TOOL_REGISTRY.clear()
         TOOL_REGISTRY.update(original_registry)
         TOOL_METADATA.clear()
