@@ -18,15 +18,19 @@ import mindroom.tool_system.plugin_imports as plugin_imports
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.constants import ROUTER_AGENT_NAME, resolve_runtime_paths
-from mindroom.hooks import AgentLifecycleContext, HookRegistry, ToolAfterCallContext
+from mindroom.hooks import AgentLifecycleContext, HookBindings, ToolAfterCallContext
 from mindroom.logging_config import get_logger
 from mindroom.message_target import MessageTarget
 from mindroom.thread_tags import ThreadTagRecord, ThreadTagsState
 from mindroom.tool_system.metadata import get_tool_by_name
-from mindroom.tool_system.plugins import load_plugins
-from mindroom.tool_system.registry_state import TOOL_METADATA, TOOL_REGISTRY
+from mindroom.tool_system.plugins import (
+    ConfigPlugins,
+    PluginGeneration,
+    config_plugins,
+    prepare_plugins,
+    publish_plugins,
+)
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
-from mindroom.tool_system.skills import get_plugin_skill_roots, set_plugin_skill_roots
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -39,7 +43,7 @@ if TYPE_CHECKING:
 class _LoadedThreadSnooze:
     config: Config
     runtime_paths: RuntimePaths
-    registry: HookRegistry
+    plugins: ConfigPlugins
     plugin_root: Path
     hooks_module: ModuleType
     tools_module: ModuleType
@@ -124,10 +128,11 @@ def _tool_context(
         client=AsyncMock(),
         config=loaded.config,
         runtime_paths=loaded.runtime_paths,
+        plugins=loaded.plugins,
         **_conversation_collaborators(),
         room=MagicMock(),
         storage_path=None,
-        hook_message_sender=AsyncMock(return_value="$hook-event"),
+        hooks=HookBindings(message_sender=AsyncMock(return_value="$hook-event")),
         correlation_id="corr-thread-snooze-tool",
     )
 
@@ -206,22 +211,18 @@ def loaded_thread_snooze(tmp_path: Path) -> Generator[_LoadedThreadSnooze, None,
         plugins=[str(plugin_root)],
     )
 
-    original_registry = TOOL_REGISTRY.copy()
-    original_metadata = TOOL_METADATA.copy()
-    original_plugin_roots = get_plugin_skill_roots()
-    original_plugin_cache = plugin_imports._PLUGIN_CACHE.copy()
-    original_module_cache = plugin_imports._MODULE_IMPORT_CACHE.copy()
+    generation = prepare_plugins(config, runtime_paths)
+    assert not generation.skipped
 
+    publish_plugins(generation)
     hooks_module: ModuleType | None = None
     try:
-        plugins = load_plugins(config, runtime_paths)
-        registry = HookRegistry.from_plugins(plugins)
         hooks_module = _loaded_plugin_module(plugin_root / "hooks.py")
         tools_module = _loaded_plugin_module(plugin_root / "tools.py")
         yield _LoadedThreadSnooze(
             config=config,
             runtime_paths=runtime_paths,
-            registry=registry,
+            plugins=config_plugins(config, runtime_paths),
             plugin_root=plugin_root,
             hooks_module=hooks_module,
             tools_module=tools_module,
@@ -231,15 +232,7 @@ def loaded_thread_snooze(tmp_path: Path) -> Generator[_LoadedThreadSnooze, None,
             for task in list(hooks_module._snooze_tasks.values()):
                 task.cancel()
             hooks_module._snooze_tasks.clear()
-        TOOL_REGISTRY.clear()
-        TOOL_REGISTRY.update(original_registry)
-        TOOL_METADATA.clear()
-        TOOL_METADATA.update(original_metadata)
-        plugin_imports._PLUGIN_CACHE.clear()
-        plugin_imports._PLUGIN_CACHE.update(original_plugin_cache)
-        plugin_imports._MODULE_IMPORT_CACHE.clear()
-        plugin_imports._MODULE_IMPORT_CACHE.update(original_module_cache)
-        set_plugin_skill_roots(original_plugin_roots)
+        publish_plugins(PluginGeneration())
 
 
 def test_parse_snooze_until_accepts_aware_datetimes(loaded_thread_snooze: _LoadedThreadSnooze) -> None:
@@ -266,7 +259,7 @@ def test_parse_snooze_until_rejects_invalid_values(loaded_thread_snooze: _Loaded
 
 
 def test_bot_ready_hook_is_router_scoped(loaded_thread_snooze: _LoadedThreadSnooze) -> None:
-    ready_hooks = loaded_thread_snooze.registry.hooks_for("bot:ready")
+    ready_hooks = loaded_thread_snooze.plugins.hooks.hooks_for("bot:ready")
 
     assert len(ready_hooks) == 1
     assert ready_hooks[0].hook_name == "thread-snooze-resume"
@@ -607,7 +600,12 @@ async def test_after_call_cancels_manual_unsnooze_tags(loaded_thread_snooze: _Lo
 
 @pytest.mark.asyncio
 async def test_snooze_thread_sets_tags_and_spawns_task(loaded_thread_snooze: _LoadedThreadSnooze) -> None:
-    tool = get_tool_by_name("thread_snooze", loaded_thread_snooze.runtime_paths, worker_target=None)
+    tool = get_tool_by_name(
+        "thread_snooze",
+        loaded_thread_snooze.runtime_paths,
+        tools=loaded_thread_snooze.plugins.tools,
+        worker_target=None,
+    )
     assert tool is not None
     until = datetime.now(UTC) + timedelta(hours=1)
     context = _tool_context(loaded_thread_snooze)
@@ -659,7 +657,12 @@ async def test_snooze_thread_sets_tags_and_spawns_task(loaded_thread_snooze: _Lo
 
 @pytest.mark.asyncio
 async def test_snooze_thread_rejects_past_datetimes(loaded_thread_snooze: _LoadedThreadSnooze) -> None:
-    tool = get_tool_by_name("thread_snooze", loaded_thread_snooze.runtime_paths, worker_target=None)
+    tool = get_tool_by_name(
+        "thread_snooze",
+        loaded_thread_snooze.runtime_paths,
+        tools=loaded_thread_snooze.plugins.tools,
+        worker_target=None,
+    )
     assert tool is not None
 
     with (
@@ -675,7 +678,12 @@ async def test_snooze_thread_rejects_past_datetimes(loaded_thread_snooze: _Loade
 
 @pytest.mark.asyncio
 async def test_snooze_thread_requires_thread_context(loaded_thread_snooze: _LoadedThreadSnooze) -> None:
-    tool = get_tool_by_name("thread_snooze", loaded_thread_snooze.runtime_paths, worker_target=None)
+    tool = get_tool_by_name(
+        "thread_snooze",
+        loaded_thread_snooze.runtime_paths,
+        tools=loaded_thread_snooze.plugins.tools,
+        worker_target=None,
+    )
     assert tool is not None
 
     with tool_runtime_context(_tool_context(loaded_thread_snooze, thread_id=None, resolved_thread_id=None)):
@@ -687,7 +695,12 @@ async def test_snooze_thread_requires_thread_context(loaded_thread_snooze: _Load
 
 @pytest.mark.asyncio
 async def test_unsnooze_thread_removes_tags_and_cancels_task(loaded_thread_snooze: _LoadedThreadSnooze) -> None:
-    tool = get_tool_by_name("thread_snooze", loaded_thread_snooze.runtime_paths, worker_target=None)
+    tool = get_tool_by_name(
+        "thread_snooze",
+        loaded_thread_snooze.runtime_paths,
+        tools=loaded_thread_snooze.plugins.tools,
+        worker_target=None,
+    )
     assert tool is not None
     context = _tool_context(loaded_thread_snooze)
 
@@ -741,7 +754,12 @@ async def test_unsnooze_thread_removes_tags_and_cancels_task(loaded_thread_snooz
 
 @pytest.mark.asyncio
 async def test_unsnooze_thread_errors_when_not_snoozed(loaded_thread_snooze: _LoadedThreadSnooze) -> None:
-    tool = get_tool_by_name("thread_snooze", loaded_thread_snooze.runtime_paths, worker_target=None)
+    tool = get_tool_by_name(
+        "thread_snooze",
+        loaded_thread_snooze.runtime_paths,
+        tools=loaded_thread_snooze.plugins.tools,
+        worker_target=None,
+    )
     assert tool is not None
 
     with (
