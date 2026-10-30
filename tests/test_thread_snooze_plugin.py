@@ -6,7 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -47,23 +47,6 @@ class _LoadedThreadSnooze:
     plugin_root: Path
     hooks_module: ModuleType
     tools_module: ModuleType
-
-
-# This plugin reads none of MindRoom's conversation collaborators; it only has
-# to name the required ones to build a context at all. Which ones those are is
-# moving: the event-journal cutover drops `event_cache` for `conversation_reader`
-# and `relations`, and retires the conversation cache after that. Naming every
-# spelling and passing only the ones the installed MindRoom declares keeps this
-# suite green on both sides of that change instead of pinning it to one.
-_CONVERSATION_COLLABORATORS = frozenset(
-    {"conversation_cache", "conversation_reader", "event_cache", "relations"},
-)
-
-
-def _conversation_collaborators() -> dict[str, AsyncMock]:
-    """Return a stand-in for each conversation collaborator this MindRoom declares."""
-    declared = {field.name for field in fields(ToolRuntimeContext)}
-    return {name: AsyncMock() for name in _CONVERSATION_COLLABORATORS & declared}
 
 
 def _plugin_root() -> Path:
@@ -129,7 +112,8 @@ def _tool_context(
         config=loaded.config,
         runtime_paths=loaded.runtime_paths,
         plugins=loaded.plugins,
-        **_conversation_collaborators(),
+        conversation_reader=AsyncMock(),
+        relations=AsyncMock(),
         room=MagicMock(),
         storage_path=None,
         hooks=HookBindings(message_sender=AsyncMock(return_value="$hook-event")),
