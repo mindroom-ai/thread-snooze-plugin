@@ -14,7 +14,6 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-import mindroom.tool_system.plugin_imports as plugin_imports
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.constants import ROUTER_AGENT_NAME, resolve_runtime_paths
@@ -61,13 +60,9 @@ def _copy_plugin_root(tmp_path: Path) -> Path:
     return copied_root
 
 
-def _loaded_plugin_module(module_path: Path) -> ModuleType:
-    """Return the one loaded plugin module executed from a file, whatever the module cache is keyed by."""
-    (module,) = (
-        cached.module
-        for cached in plugin_imports._MODULE_IMPORT_CACHE.values()
-        if cached.module.__file__ == str(module_path)
-    )
+def _loaded_plugin_module(generation: PluginGeneration, module_path: Path) -> ModuleType:
+    """Return the one module of ``generation`` executed from a file, whatever it is named."""
+    (module,) = (module for module in generation.modules.values() if module.__file__ == str(module_path))
     return module
 
 
@@ -201,8 +196,8 @@ def loaded_thread_snooze(tmp_path: Path) -> Generator[_LoadedThreadSnooze, None,
     publish_plugins(generation)
     hooks_module: ModuleType | None = None
     try:
-        hooks_module = _loaded_plugin_module(plugin_root / "hooks.py")
-        tools_module = _loaded_plugin_module(plugin_root / "tools.py")
+        hooks_module = _loaded_plugin_module(generation, plugin_root / "hooks.py")
+        tools_module = _loaded_plugin_module(generation, plugin_root / "tools.py")
         yield _LoadedThreadSnooze(
             config=config,
             runtime_paths=runtime_paths,
