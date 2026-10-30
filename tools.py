@@ -27,7 +27,6 @@ from mindroom.tool_system.registration import register_tool_with_metadata
 from mindroom.tool_system.runtime_context import (
     ToolRuntimeContext,
     get_tool_runtime_context,
-    resolve_tool_runtime_hook_bindings,
 )
 
 if TYPE_CHECKING:
@@ -69,7 +68,7 @@ def _hooks_module() -> ModuleType:
 
 
 def _build_wake_bindings(context: ToolRuntimeContext) -> tuple[Any, Any, Any]:
-    bindings = resolve_tool_runtime_hook_bindings(context)
+    bindings = context.hooks
 
     async def send_message(room_id: str, text: str, thread_id: str | None) -> str | None:
         if bindings.message_sender is None:
